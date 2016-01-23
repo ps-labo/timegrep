@@ -1,0 +1,580 @@
+#!/usr/bin/perl
+#
+# 様々な日付時刻形式を自動判別し、
+# 指定した時刻の間に含まれる行を抜き出すスクリプト
+#
+# timegrep --start= --end=xxx or --recent=xxx [ファイル名]
+#
+# パラメータを付与しない場合は、直近１時間のログを抜く
+# この動きを変える場合は --recent で遡及したい分数を指定する。
+#
+# --start および --end では以下の指定が可能
+# なお、日付を省略した場合は、本日の日付が指定されたものとする。
+#
+# %a %b %d %H:%M:%S %Z %Y
+# %d/%m/%Y %H:%M:%S
+# %d/%m/%Y:%H:%M:%S
+# %m %d, %Y %H:%M:%S
+# %m %d, %Y %I:%M:%S %p
+# %Y/%m/%d %H:%M:%S
+# %Y年 %m月 %d日 %A %H:%M:%S %Z
+# Wed Apr 18 11:42:49 JST 2015
+# %Y/%m/%d %H:%M
+# %Y/%m/%d %H
+# %Y/%m/%d
+# %H:%M:%S
+# %H:%M
+# %s
+#
+# 判定可能な日付形式も上記のリストに準じる。
+# （ただし日付抜きの時刻文字列は抽出対象外）
+#
+
+use POSIX;
+use Getopt::Long qw(:config posix_default no_ignore_case gnu_compat);
+use warnings;
+use strict;
+use utf8;
+use Encode;
+use 5.010;
+
+
+# 時刻だけの文字列を検出対象とするかどうか。
+#
+# コマンドライン引数の評価時は時刻だけの文字列を検出したいけど、
+# ログの検査時は無視したい。しかし検出ロジックは共用したいので
+# この変数で検出ロジックの挙動を変える。
+my $detect_houronly_string=1;
+
+# 月の名前や午前午後の指定を数値化するためのマッピング用配列や
+# 各月の最終日の配列など。
+my %month_string2num;
+my %ampm_string2hour;
+my @day_of_month;
+
+$month_string2num{"Jan"}=1;
+$month_string2num{"Feb"}=2;
+$month_string2num{"Mar"}=3;
+$month_string2num{"Apr"}=4;
+$month_string2num{"May"}=5;
+$month_string2num{"Jun"}=6;
+$month_string2num{"Jul"}=7;
+$month_string2num{"Aug"}=8;
+$month_string2num{"Sep"}=9;
+$month_string2num{"Oct"}=10;
+$month_string2num{"Nov"}=11;
+$month_string2num{"Dec"}=12;
+
+$month_string2num{"1"}=1;
+$month_string2num{"2"}=2;
+$month_string2num{"3"}=3;
+$month_string2num{"4"}=4;
+$month_string2num{"5"}=5;
+$month_string2num{"6"}=6;
+$month_string2num{"7"}=7;
+$month_string2num{"8"}=8;
+$month_string2num{"9"}=9;
+$month_string2num{"01"}=1;
+$month_string2num{"02"}=2;
+$month_string2num{"03"}=3;
+$month_string2num{"04"}=4;
+$month_string2num{"05"}=5;
+$month_string2num{"06"}=6;
+$month_string2num{"07"}=7;
+$month_string2num{"08"}=8;
+$month_string2num{"09"}=9;
+$month_string2num{"10"}=10;
+$month_string2num{"11"}=11;
+$month_string2num{"12"}=12;
+
+$day_of_month[1]=31;
+$day_of_month[2]=28;
+$day_of_month[3]=31;
+$day_of_month[4]=30;
+$day_of_month[5]=31;
+$day_of_month[6]=30;
+$day_of_month[7]=31;
+$day_of_month[8]=31;
+$day_of_month[9]=30;
+$day_of_month[10]=31;
+$day_of_month[11]=30;
+$day_of_month[12]=31;
+
+$ampm_string2hour{"午後"}=12;
+$ampm_string2hour{"PM"}=12;
+$ampm_string2hour{"pm"}=12;
+
+my @detect_order;
+my $detect_num=0;
+
+$detect_order[$detect_num++]="detect_wday_month_mday_time_tz_year";
+$detect_order[$detect_num++]="detect_mday_month_year_time";
+$detect_order[$detect_num++]="detect_month_mday_year_time";
+$detect_order[$detect_num++]="detect_year_month_mday_time";
+$detect_order[$detect_num++]="detect_year_month_mday_time_kanji";
+$detect_order[$detect_num++]="detect_year_month_mday_hour_minute";
+$detect_order[$detect_num++]="detect_year_month_mday_hour";
+$detect_order[$detect_num++]="detect_year_month_mday";
+$detect_order[$detect_num++]="detect_year_hour_minute_second";
+$detect_order[$detect_num++]="detect_hour_minute";
+$detect_order[$detect_num++]="detect_unixtime";
+
+my %detect_datetime_func = (
+	detect_wday_month_mday_time_tz_year => \&detect_wday_month_mday_time_tz_year,
+	detect_mday_month_year_time => \&detect_mday_month_year_time,
+	detect_month_mday_year_time => \&detect_month_mday_year_time,
+	detect_year_month_mday_time => \&detect_year_month_mday_time,
+	detect_year_month_mday_time_kanji => \&detect_year_month_mday_time_kanji,
+	detect_year_month_mday_hour_minute => \&detect_year_month_mday_hour_minute,
+	detect_year_month_mday_hour => \&detect_year_month_mday_hour,
+	detect_year_month_mday => \&detect_year_month_mday,
+	detect_year_hour_minute_second => \&detect_year_hour_minute_second,
+	detect_hour_minute => \&detect_hour_minute,
+	detect_unixtime => \&detect_unixtime
+);
+
+
+
+
+# 引数の評価
+my %opts = (
+	start => "", begin => "", after => "",
+	end => "9223372036854775807",
+	before => "9223372036854775807",
+	recent => "60" );
+GetOptions( \%opts, qw( start=s begin=s after=s end=s before=s recent=i ) ) or exit 1;
+
+my $start =0;
+my $end   =9223372036854775807;
+my $recent=60;
+
+if ( $opts{"recent"} >= 0 ) {
+	$recent=$opts{"recent"};
+}
+
+if ($opts{"start"} ne "" ) {
+	# 指定された文字列を日時の始点とする。
+	$start=&convert_datetime_string2unixtime( $opts{"start"} );
+} else {
+		# 時刻指定が無ければ、現在時刻から指定分だけ遡った時刻を始点とする。
+	if ($opts{"end"}    eq "" ) {
+		$start= time - 60 * $recent;
+	}
+}
+
+if ($opts{"end"}    ne "" ) {
+	# 指定された文字列を日時の終点とする。
+	$end  =&convert_datetime_string2unixtime( $opts{"end"} );
+} else {
+	# パラメータ end  は初期値が ""  ではないので、
+	# 実はこの処理が走ることはない。
+	#
+	# この処理が走った場合は、現在時刻を終点とする。
+	$end  = time;
+}
+
+# ここから先の処理では時刻だけの文字列を検出対象から外す。
+$detect_houronly_string=0;
+
+
+# メインループ
+if ( @ARGV == 0 ) {
+	&analyze_log( "/dev/stdin" );
+} else {
+	for ( my $numfiles = 0 ; $numfiles < @ARGV ; $numfiles++ ) {
+		if ( -r $ARGV[$numfiles] ) { 
+			&analyze_log( $ARGV[$numfiles] );
+		}
+	}
+}
+
+exit 0;
+
+
+
+
+# 指定されたファイルを読み、指定期間のログがあれば出力する。
+sub analyze_log {
+	my ( $filename ) = @_;
+	my $unixtime_prev=0;
+
+	open( IN, "< $filename" );
+	while(<IN>) {
+
+		# 入力文字列は utf8 から内部形式に変換する（お約束）
+		$_ = decode_utf8( $_ );
+
+		# 標準入力から読んだ行に日付時刻が含まれていたら unix 秒で受け取る
+		my $unixtime = &convert_datetime_string2unixtime( $_ );
+
+		# $unixtime が -1 の場合はログから日時を解釈できていないので
+		# 直前の行評価で取得できた日時を用いる。
+		if ( $unixtime == -1 ) {
+			$unixtime = $unixtime_prev;
+		}
+
+		# 検出した日付が直前の行より古い場合も
+		# 直前の行評価で取得できた日時を用いる。
+		if ( $unixtime < $unixtime_prev ) {
+			$unixtime = $unixtime_prev;
+		}
+
+		#  ログの日付時刻が指定範囲内なら行を表示する。
+		if ( $start <= $unixtime && $unixtime <= $end ) {
+			#print "$start $unixtime $end ";
+
+			# 出力文字列は内部形式から utf8 に変換する（お約束）
+			print encode_utf8($_);
+		}
+
+		# この行の unix秒を記憶しておき、次の行で時刻が取得できなかった場合の
+		# 代替え用に用いる。1
+		$unixtime_prev=$unixtime;
+	}
+}
+
+# 日付時刻を評価して unix 秒に変換する処理
+# やっていることは単に正規表現でパターンマッチするだけなので
+# 細かい説明は要るまい。。。
+sub convert_datetime_string2unixtime {
+	my ( $line ) = @_;
+	my $unixtime = -1;
+	my $day=0;
+	my $month=0;
+	my $year=0;
+	my $hour=0;
+	my $minute=0;
+	my $second=0;
+	my $timezone=0;
+
+	state $function_prev="";
+
+	# 直前に成功したパターンマッチがあれば、そのパターンマッチを再度行う
+	if ( $function_prev ne "" ) {
+		$unixtime = $detect_datetime_func{$function_prev}->( $line );
+	}
+
+	# パターンマッチの再実行で判定できなかった場合や
+	# 初回のパターンマッチの場合は全部のパターンマッチを試す。
+	if ( $unixtime == -1 ) {
+		eval{
+			foreach my $key ( @detect_order ) {
+				$unixtime = $detect_datetime_func{$key}->( $line );
+
+				if ( $unixtime != -1 ) {
+					$function_prev=$key;
+					break;
+				}
+			}
+		};
+	}
+
+	if($@) {
+		return $unixtime;
+	}
+	return $unixtime;
+}
+
+
+sub detect_wday_month_mday_time_tz_year {
+	my ( $line ) = @_;
+	my $unixtime = -1;
+	my $day=0;
+	my $month=0;
+	my $year=0;
+	my $hour=0;
+	my $minute=0;
+	my $second=0;
+	my $timezone=0;
+
+	if ( $line =~ /[A-Za-z]{3} ([A-Za-z]{3}) ([0-9]{1,2}) ([0-9]{1,2}):([0-9]{1,2}):([0-9]{1,2}) [A-Za-z]{3} ([0-9]{4,})/o ) {
+
+		# wDay month mday hh:mm:ss timezone year
+		$day=$2;
+		$month=$month_string2num{$1} or die 'xxx';
+		$year=$6;
+
+		$hour=$3;
+		$minute=$4;
+		$second=$5;
+
+		$unixtime = mktime($second, $minute, $hour, $day, $month - 1, $year - 1900 );
+	}
+	return $unixtime
+}
+
+sub detect_mday_month_year_time {
+	my ( $line ) = @_;
+	my $unixtime = -1;
+	my $day=0;
+	my $month=0;
+	my $year=0;
+	my $hour=0;
+	my $minute=0;
+	my $second=0;
+	my $timezone=0;
+
+	if ( $line =~ /([0-9]{1,2})\/([0-9A-Za-z]{1,3})\/([0-9]{4,})[: ]([0-9]+):([0-9]+):([0-9]+) ([+\-]?)([0-9][0-9]):?([0-9][0-9])/o ) {
+		# mday/month/year hh:mm:ss
+		# mday/month/year:hh:mm:ss
+
+		$day=$1;
+		$month=$month_string2num{$2} or die 'xxx';
+		$year=$3;
+
+		$hour=$4;
+		$minute=$5;
+		$second=$6;
+		$timezone=$9 + $8 * 60;
+
+		$unixtime = mktime($second, $minute, $hour, $day, $month - 1, $year - 1900 );
+	}
+	return $unixtime
+}
+
+
+sub detect_month_mday_year_time {
+	my ( $line ) = @_;
+	my $unixtime = -1;
+	my $day=0;
+	my $month=0;
+	my $year=0;
+	my $hour=0;
+	my $minute=0;
+	my $second=0;
+	my $timezone=0;
+
+	if ( $line =~ /([0-9A-Za-z]*) ([0-9]{1,2}), ([0-9]{4,}) ([0-9]{1,2}):([0-9]{1,2}):([0-9]{1,2}) (.*?) /o ) {
+		# month mday, year hh:mm:ss
+		# month mday, year hh:mm:ss (am|pm)
+
+		$month=$month_string2num{$1} or die 'yyy';
+		$day=$2;
+		$year=$3;
+
+		$hour=$4;
+		$minute=$5;
+		$second=$6;
+
+		# 午前/午後の時刻補正処理
+		if ( defined($7) ) {
+			if ( exists $ampm_string2hour{$7} ) {
+				$hour += $ampm_string2hour{$7};
+			}
+		}
+
+		$timezone=0;
+
+		$unixtime = mktime($second, $minute, $hour, $day, $month - 1, $year - 1900 );
+	}
+	return $unixtime
+}
+
+sub detect_year_month_mday_time {
+	my ( $line ) = @_;
+	my $unixtime = -1;
+	my $day=0;
+	my $month=0;
+	my $year=0;
+	my $hour=0;
+	my $minute=0;
+	my $second=0;
+	my $timezone=0;
+
+	if ( $line =~ /([0-9]{4,})[\-\/]([0-9]{1,2})[\-\/]([0-9]{1,2})[ T]([0-9]{1,2}):([0-9]{1,2}):([0-9]{1,2})/o ) {
+		# yyyy/mm/dd hh:mm:ss
+
+		$year=$1;
+		$month=$month_string2num{$2} or die 'zzz';
+		$day=$3;
+
+		$hour=$4;
+		$minute=$5;
+		$second=$6;
+
+		$unixtime = mktime($second, $minute, $hour, $day, $month - 1, $year - 1900 );
+	}
+	return $unixtime
+}
+
+sub detect_year_month_mday_time_kanji {
+	my ( $line ) = @_;
+	my $unixtime = -1;
+	my $day=0;
+	my $month=0;
+	my $year=0;
+	my $hour=0;
+	my $minute=0;
+	my $second=0;
+	my $timezone=0;
+
+	if ( $line =~ /([0-9]{4,})年[ ]{1,2}([0-9]{1,2})月[ ]{1,2}([0-9]{1,2})日 (.*?) ([0-9]{1,2}):([0-9]{1,2}):([0-9]{1,2}) [A-Za-z]{3}/o ) {
+		# 2015年  4月 15日 水曜日 11:42:47 JST
+		# 2015年 10月 15日 木曜日 11:42:47 JST
+
+		$year=$1;
+		$month=$2;
+		$day=$3;
+
+		$hour=$5;
+		$minute=$6;
+		$second=$7;
+
+		$unixtime = mktime($second, $minute, $hour, $day, $month - 1, $year - 1900 );
+	}
+	return $unixtime
+}
+
+sub detect_year_month_mday_hour_minute {
+	my ( $line ) = @_;
+	my $unixtime = -1;
+	my $day=0;
+	my $month=0;
+	my $year=0;
+	my $hour=0;
+	my $minute=0;
+	my $second=0;
+	my $timezone=0;
+
+	if ( $line =~ /([0-9]{4,})[\-\/]([0-9]{1,2})[\-\/]([0-9]{1,2})[ T]([0-9]{1,2}):([0-9]{1,2})/o ) {
+		# yyyy/mm/dd hh:mm
+		$year=$1;
+		$month=$month_string2num{$2} or die 'zzz';
+		$day=$3;
+
+		$hour=$4;
+		$minute=$5;
+		$second=0;
+
+		$unixtime = mktime($second, $minute, $hour, $day, $month - 1, $year - 1900 );
+	}
+	return $unixtime
+}
+
+sub detect_year_month_mday_hour {
+	my ( $line ) = @_;
+	my $unixtime = -1;
+	my $day=0;
+	my $month=0;
+	my $year=0;
+	my $hour=0;
+	my $minute=0;
+	my $second=0;
+	my $timezone=0;
+
+	if ( $line =~ /([0-9]{4,})[\-\/]([0-9]{1,2})[\-\/]([0-9]{1,2})[ T]([0-9]{1,2})/o ) {
+		# yyyy/mm/dd hh
+
+		$year=$1;
+		$month=$month_string2num{$2} or die 'zzz';
+		$day=$3;
+
+		$hour=$4;
+		$minute=0;
+		$second=0;
+
+		$unixtime = mktime($second, $minute, $hour, $day, $month - 1, $year - 1900 );
+	}
+	return $unixtime
+}
+
+sub detect_year_month_mday {
+	my ( $line ) = @_;
+	my $unixtime = -1;
+	my $day=0;
+	my $month=0;
+	my $year=0;
+	my $hour=0;
+	my $minute=0;
+	my $second=0;
+	my $timezone=0;
+
+	if ( $line =~ /([0-9]{4,})[\-\/]([0-9]{1,2})[\-\/]([0-9]{1,2})/o ) {
+		# yyyy/mm/dd
+
+		$year=$1;
+		$month=$month_string2num{$2} or die 'zzz';
+		$day=$3;
+
+		$hour=0;
+		$minute=0;
+		$second=0;
+
+		$unixtime = mktime($second, $minute, $hour, $day, $month - 1, $year - 1900 );
+	}
+	return $unixtime
+}
+
+sub detect_year_hour_minute_second {
+	my ( $line ) = @_;
+	my $unixtime = -1;
+	my $day=0;
+	my $month=0;
+	my $year=0;
+	my $hour=0;
+	my $minute=0;
+	my $second=0;
+	my $timezone=0;
+
+	if ( $detect_houronly_string == 1 && $line =~ /([0-9]{1,2}):([0-9]{1,2}):([0-9]{1,2})/o ) {
+		# hh:mm:ss
+
+		($second, $minute, $hour, $day, $month, $year ) = localtime;
+
+		$year  += 1900;
+		$month += 1;
+
+		$hour=$1;
+		$minute=$2;
+		$second=$3;
+
+		$unixtime = mktime($second, $minute, $hour, $day, $month - 1, $year - 1900 );
+	}
+	return $unixtime
+}
+
+sub detect_hour_minute {
+	my ( $line ) = @_;
+	my $unixtime = -1;
+	my $day=0;
+	my $month=0;
+	my $year=0;
+	my $hour=0;
+	my $minute=0;
+	my $second=0;
+	my $timezone=0;
+
+	if ( $detect_houronly_string == 1 && $line =~ /([0-9]{1,2}):([0-9]{1,2})/o ) {
+		# hh:mm
+
+		($second, $minute, $hour, $day, $month, $year ) = localtime;
+
+		$year  += 1900;
+		$month += 1;
+
+		$hour=$1;
+		$minute=$2;
+		$second=0;
+
+		$unixtime = mktime($second, $minute, $hour, $day, $month - 1, $year - 1900 );
+	}
+	return $unixtime
+}
+
+sub detect_unixtime {
+	my ( $line ) = @_;
+	my $unixtime = -1;
+	my $day=0;
+	my $month=0;
+	my $year=0;
+	my $hour=0;
+	my $minute=0;
+	my $second=0;
+	my $timezone=0;
+
+	if ( $line =~ /([0-9]{10,})/o ) {
+		# 10桁以上の数値は unix 秒とみなす。
+		$unixtime=$1;
+	}
+	return $unixtime
+}
