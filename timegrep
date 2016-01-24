@@ -177,7 +177,7 @@ my %opts = (
 	help   => 0,
 	debug  => 0,
 	start  => "",
-	end    => 9223372036854775807,
+	end    => "",
 	recent => 60
 	);
 
@@ -288,11 +288,12 @@ debugprintf( $logger_debug, "read line: readpointer=%d, linecount=%d, unixtime=%
 				# この行の unix秒を記憶しておき、次の行で時刻が取得できなかった場合の
 				# 代替え用に用いる。1
 				$unixtime_prev=$unixtime;
-	#print "$unixtime ";
 			}
 #			$readpointer_prev_ok_end = $linecount;
 
 			if ( $hopsearch == 1 ) {
+debugprintf( $logger_info, encode_utf8("start hopsearch: reacpointer=%s, linecount=%s, unixtime=%s\n"),
+	$readpointer, $linecount, $unixtime );
 
 				# 現在のバッファ内に抽出開始位置や抽出終了位置が含まれるか否かを調べる
 
@@ -312,8 +313,8 @@ debugprintf( $logger_debug, "read line: readpointer=%d, linecount=%d, unixtime=%
 							$readpointer = $linecount;
 							$unixtime_prev=0;
 						}
-debugprintf( $logger_info, encode_utf8("末尾方向にサーチします。start(%s) >= unixtime(%s)\n"),
-	encode_utf8(unixtime2string($start)), encode_utf8(unixtime2string($unixtime)) );
+debugprintf( $logger_info, encode_utf8("末尾方向にサーチします。start(%s) >= unixtime(%s), readpointer=%s\n"),
+	encode_utf8(unixtime2string($start)), encode_utf8(unixtime2string($unixtime)), $readpointer );
 					} elsif ( $start <= $unixtime ) {
 						# ログの日時が抽出開始日時以降の場合は
 						# 検出した日付が検索開始位置を過ぎているなら、逆方向に hopsearch する。
@@ -334,22 +335,35 @@ debugprintf( $logger_info, encode_utf8("次の検索開始行を %d に変更し
 						} else {
 debugprintf( $logger_info, encode_utf8("次の検索開始行を %d から %d に変更します。\n"), $readpointer, $readpointer_prev );
 							$readpointer = $readpointer_prev;
-#							$hopsearch=0;
+
+						}
+						if ( $readpointer == 0 ) {
+							$hopsearch=0;
 						}
 					}
 
-						# 参照中の行が抽出範囲内に入っていて、
-						# かつ、既知の最終行以降ならば
-						# 既知の最終行を現在行に変更する
-						if ( $unixtime <= $end &&
-							$readpointer >= $readpointer_prev_ok_end &&
-							$linecount == $max_read &&
-							$filename ne "/dev/stdin") {
-							$readpointer_prev_ok_end=$readpointer;
-						}
+					# 参照中の行が抽出範囲内に入っていて、
+					# かつ、既知の最終行以降ならば
+					# 既知の最終行を現在行に変更する
+					if ( $unixtime <= $end &&
+						$readpointer >= $readpointer_prev_ok_end &&
+						$linecount == $max_read &&
+						$filename ne "/dev/stdin") {
+						$readpointer_prev_ok_end=$readpointer;
+					}
+
+				} else {
+					if ( int($readpointer / 2) != 1 ) {
+						$linecount = $readpointer;
+						$readpointer=$readpointer_prev;
+debugprintf( $logger_info, encode_utf8("次の検索開始行を %d に変更します。\n"), $readpointer );
+					} else {
+debugprintf( $logger_info, encode_utf8("hopserarchを終了します。\n") );
+						$hopsearch=0;
+					}
 
 				}
-debugprintf( $logger_debug, "hopsearch=%d, readpointer=%s\n", $hopsearch, $readpointer_prev_ok_start );
+debugprintf( $logger_debug, "hopsearch=%d, readpointer_prev_ok_start=%s\n", $hopsearch, $readpointer_prev_ok_start );
 			} else {
 				if ( $start <= $unixtime && $unixtime <= $end ) {
 					 #  ログの日付時刻が指定範囲内なら行を表示する。
@@ -376,14 +390,23 @@ debugprintf( $logger_debug, "linecount=%d, readpointer=%d, readpointer_prev_ok_s
 
 					my $unixtime = &convert_datetime_string2unixtime( $linedata[$printcounter] );
 
+debugprintf( $logger_debug, "linecount=%d, readpointer=%d, unixtime=%d, unixtime_prev=%d\n",
+	$linecount, $readpointer, $unixtime, $unixtime_prev );
+
 					if ( $unixtime == -1 ) {
 						$unixtime = $unixtime_prev;
 					}
+
+debugprintf( $logger_debug, "linecount=%d, readpointer=%d, unixtime=%d, unixtime_prev=%d\n",
+	$linecount, $readpointer, $unixtime, $unixtime_prev );
 
 					if ( $unixtime < $unixtime_prev ) {
 						$unixtime = $unixtime_prev;
 					}
 					$unixtime_prev=$unixtime;
+
+debugprintf( $logger_debug, "linecount=%d, readpointer=%d, unixtime=%d, unixtime_prev=%d, end=%s\n",
+	$linecount, $readpointer, $unixtime, $unixtime_prev, $end );
 
 					if ( $unixtime <= $end ) {
 						print encode_utf8($linedata[$printcounter]);
@@ -393,7 +416,6 @@ debugprintf( $logger_debug, "linecount=%d, readpointer=%d, readpointer_prev_ok_s
 			}
 debugprintf( $logger_info, "end_while: hopsearch=%d\n\n", $hopsearch );
 #debugsleep( 0, 0.5 );
-#sleep 1;
 		}
 	}
 }
@@ -452,6 +474,8 @@ sub get_args {
 		# それにも拘わらず、この処理が走った場合は、現在時刻を終点とする。
 		$end  = time;
 	}
+
+	debugprintf( $logger_info, "start=%s, end=%s\n", $start, $end );
 
 	$$retval_start = $start;
 	$$retval_end   = $end;
@@ -516,6 +540,12 @@ sub analyze_log {
 		}
 
 		if ( $hopsearch_flag == 1 ) {
+			# 検出した日付が直前の行より古い場合も
+			# 直前の行評価で取得できた日時を用いる。
+			if ( $unixtime < $unixtime_prev && $filename ne "/dev/stdin") {
+				$unixtime = $unixtime_prev;
+			}
+
 			# 検出した日付が検索範囲よりも前ならば、さらに先に hopsearch_flag する。
 			if ( 0 < $unixtime ) {
 				if ( $unixtime < $start ) {
@@ -938,7 +968,7 @@ sub detect_unixtime {
 	my $second=0;
 	my $timezone=0;
 
-	if ( $line =~ /([0-9]{10,})/o ) {
+	if ( $line =~ /[ ¥t]([0-9]{10,})[ ¥t]/o ) {
 		# 10桁以上の数値は unix 秒とみなす。
 		$unixtime=$1;
 	}
