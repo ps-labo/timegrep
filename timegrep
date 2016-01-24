@@ -1,34 +1,50 @@
 #!/usr/bin/perl
 #
-# 様々な日付時刻形式を自動判別し、
-# 指定した時刻の間に含まれる行を抜き出すスクリプト
+sub print_usage{
+
+print << "EOF"
+
+
+様々な日付時刻形式を自動判別し、
+指定した時刻の間に含まれる行を抜き出すスクリプト
+
+  timegrep --start= --end=xxx or --recent=xxx [ファイル名]
+
+パラメータを付与しない場合は、直近１時間のログを抜く
+この動きを変える場合は --recent で遡及したい分数を指定する。
+
+--start および --end では以下の指定が可能
+なお、日付を省略した場合は、本日の日付が指定されたものとする。
+
+  %a %b %d %H:%M:%S %Z %Y
+  %d/%m/%Y %H:%M:%S
+  %d/%m/%Y:%H:%M:%S
+  %m %d,%Y %H:%M:%S
+  %m %d,%Y %I:%M:%S %p
+  %Y年 %m月 %d日 %A %H:%M:%S %Z
+  Wed Apr 18 11:42:49 JST 2015
+  %Y/%m/%d %H:%M
+  %Y/%m/%d %H
+  %Y/%m/%d
+  %H:%M:%S
+  %H:%M
+  %s
+
+判定可能な日付形式も上記のリストに準じる。
+（ただし日付抜きの時刻文字列は抽出対象外）
+
+
+EOF
+
+}
 #
-# timegrep --start= --end=xxx or --recent=xxx [ファイル名]
-#
-# パラメータを付与しない場合は、直近１時間のログを抜く
-# この動きを変える場合は --recent で遡及したい分数を指定する。
-#
-# --start および --end では以下の指定が可能
-# なお、日付を省略した場合は、本日の日付が指定されたものとする。
-#
-# %a %b %d %H:%M:%S %Z %Y
-# %d/%m/%Y %H:%M:%S
-# %d/%m/%Y:%H:%M:%S
-# %m %d, %Y %H:%M:%S
-# %m %d, %Y %I:%M:%S %p
-# %Y/%m/%d %H:%M:%S
-# %Y年 %m月 %d日 %A %H:%M:%S %Z
-# Wed Apr 18 11:42:49 JST 2015
-# %Y/%m/%d %H:%M
-# %Y/%m/%d %H
-# %Y/%m/%d
-# %H:%M:%S
-# %H:%M
-# %s
-#
-# 判定可能な日付形式も上記のリストに準じる。
-# （ただし日付抜きの時刻文字列は抽出対象外）
-#
+# date		comment
+# 2016/01/24	日時判定処理の正規表現を一部修正。
+# 2016/01/21	２分探索法をファイルポインタの移動ではなく自前のバッファリングに
+#				実装を変更してパイプ渡しでも高速化を実現。
+# 2016/01/20	recent が効かなくなった不具合を修正
+# 2015/12/09	"12 09, 2015 12:00:00 午後" を "2015/12/10 00:00:00" と扱う不具合を修正。
+#		対象ファイル名を引数渡しする場合は二分探索法による高速検索を行うように修正。
 
 use POSIX;
 use Getopt::Long qw(:config posix_default no_ignore_case gnu_compat);
@@ -51,6 +67,8 @@ my $detect_houronly_string=1;
 my %month_string2num;
 my %ampm_string2hour;
 my @day_of_month;
+
+$| = 1;
 
 $month_string2num{"Jan"}=1;
 $month_string2num{"Feb"}=2;
@@ -108,6 +126,7 @@ my @detect_order;
 my $detect_num=0;
 
 $detect_order[$detect_num++]="detect_wday_month_mday_time_tz_year";
+$detect_order[$detect_num++]="detect_wday_month_mday_time_year";
 $detect_order[$detect_num++]="detect_mday_month_year_time";
 $detect_order[$detect_num++]="detect_month_mday_year_time";
 $detect_order[$detect_num++]="detect_year_month_mday_time";
@@ -119,87 +138,357 @@ $detect_order[$detect_num++]="detect_year_hour_minute_second";
 $detect_order[$detect_num++]="detect_hour_minute";
 $detect_order[$detect_num++]="detect_unixtime";
 
+my $logger_debug=4;
+my $logger_info=3;
+my $logger_warn=2;
+my $logger_error=1;
+my $logger_fatal=0;
+my @logger_label;
+$logger_label[0]="FATAL";
+$logger_label[1]="ERROR";
+$logger_label[2]="WARN";
+$logger_label[3]="INFO";
+$logger_label[4]="DEBUG";
+
+my %ext_pattern;
+$ext_pattern{"gz"} ="gunzip --stdout";
+$ext_pattern{"bz2"}="bunzip2 --stdout";
+$ext_pattern{"xz"}="unxz --stdout";
+
 my %detect_datetime_func = (
-	detect_wday_month_mday_time_tz_year => \&detect_wday_month_mday_time_tz_year,
-	detect_mday_month_year_time => \&detect_mday_month_year_time,
-	detect_month_mday_year_time => \&detect_month_mday_year_time,
-	detect_year_month_mday_time => \&detect_year_month_mday_time,
-	detect_year_month_mday_time_kanji => \&detect_year_month_mday_time_kanji,
-	detect_year_month_mday_hour_minute => \&detect_year_month_mday_hour_minute,
-	detect_year_month_mday_hour => \&detect_year_month_mday_hour,
-	detect_year_month_mday => \&detect_year_month_mday,
-	detect_year_hour_minute_second => \&detect_year_hour_minute_second,
-	detect_hour_minute => \&detect_hour_minute,
-	detect_unixtime => \&detect_unixtime
+        detect_wday_month_mday_time_tz_year => \&detect_wday_month_mday_time_tz_year,
+        detect_wday_month_mday_time_year    => \&detect_wday_month_mday_time_year,
+        detect_mday_month_year_time         => \&detect_mday_month_year_time,
+        detect_month_mday_year_time         => \&detect_month_mday_year_time,
+        detect_year_month_mday_time         => \&detect_year_month_mday_time,
+        detect_year_month_mday_time_kanji   => \&detect_year_month_mday_time_kanji,
+        detect_year_month_mday_hour_minute  => \&detect_year_month_mday_hour_minute,
+        detect_year_month_mday_hour         => \&detect_year_month_mday_hour,
+        detect_year_month_mday              => \&detect_year_month_mday,
+        detect_year_hour_minute_second      => \&detect_year_hour_minute_second,
+        detect_hour_minute                  => \&detect_hour_minute,
+        detect_unixtime                     => \&detect_unixtime
 );
 
+my $function_prev="";
 
-
-
-# 引数の評価
 my %opts = (
-	start => "", begin => "", after => "",
-	end => "9223372036854775807",
-	before => "9223372036854775807",
-	recent => "60" );
-GetOptions( \%opts, qw( start=s begin=s after=s end=s before=s recent=i ) ) or exit 1;
+	usage  => 0,
+	help   => 0,
+	debug  => 0,
+	start  => "",
+	end    => 9223372036854775807,
+	recent => 60
+	);
 
-my $start =0;
-my $end   =9223372036854775807;
-my $recent=60;
+my $hopsearch_enable=1;
+my $hopsearch_disable=0;
 
-if ( $opts{"recent"} >= 0 ) {
-	$recent=$opts{"recent"};
-}
+############################################################
+# メイン処理を無名関数っぽく書いてみる。
+############################################################
+&{
 
-if ($opts{"start"} ne "" ) {
-	# 指定された文字列を日時の始点とする。
-	$start=&convert_datetime_string2unixtime( $opts{"start"} );
-} else {
-		# 時刻指定が無ければ、現在時刻から指定分だけ遡った時刻を始点とする。
-	if ($opts{"end"}    eq "" ) {
-		$start= time - 60 * $recent;
+	my $start =0;
+	my $end   =9223372036854775807;
+
+	get_args(\$start, \$end);
+
+
+	# ここから先の処理では時刻だけの文字列を検出対象から外す。
+	$detect_houronly_string=0;
+
+	# メインループ
+	if ( @ARGV == 0 ) {
+#		&analyze_log( "/dev/stdin", $start, $end, $hopsearch_disable );
+		&analyze_log_buffersearch( "/dev/stdin", $start, $end, $hopsearch_enable );
+	} else {
+		for ( my $numfiles = 0 ; $numfiles < @ARGV ; $numfiles++ ) {
+			if ( ! -e $ARGV[$numfiles] ) {
+				debugprintf( $logger_fatal, "filename '%s' not found. abort.\n", $ARGV[$numfiles] );
+				exit 1
+			}
+		}
+		for ( my $numfiles = 0 ; $numfiles < @ARGV ; $numfiles++ ) {
+			if ( -r $ARGV[$numfiles] ) {
+				#&analyze_log( $ARGV[$numfiles], $start, $end, $hopsearch_enable );
+				&analyze_log_buffersearch( $ARGV[$numfiles], $start, $end, $hopsearch_enable );
+			}
+		}
 	}
-}
 
-if ($opts{"end"}    ne "" ) {
-	# 指定された文字列を日時の終点とする。
-	$end  =&convert_datetime_string2unixtime( $opts{"end"} );
-} else {
-	# パラメータ end  は初期値が ""  ではないので、
-	# 実はこの処理が走ることはない。
-	#
-	# この処理が走った場合は、現在時刻を終点とする。
-	$end  = time;
-}
+	exit 0;
+}(@ARGV);
 
-# ここから先の処理では時刻だけの文字列を検出対象から外す。
-$detect_houronly_string=0;
+# 指定されたファイルを読み、指定期間のログがあれば出力する。
+sub analyze_log_buffersearch {
+	my ( $filename, $start, $end, $hopsearch ) = @_;
+	my $unixtime_prev=0;
 
 
-# メインループ
-if ( @ARGV == 0 ) {
-	&analyze_log( "/dev/stdin" );
-} else {
-	for ( my $numfiles = 0 ; $numfiles < @ARGV ; $numfiles++ ) {
-		if ( -r $ARGV[$numfiles] ) { 
-			&analyze_log( $ARGV[$numfiles] );
+	# ファイルが特定の形式で圧縮されている場合は展開しながら読む。
+	$filename =~ /\S+\.(\S+)$/;
+	my $ext=$1;
+debugprintf( $logger_info, "filename=%s, extension=%s\n", $filename, $ext ); 	if ( exists $ext_pattern{$ext} ) {
+		open( IN, "$ext_pattern{$ext} $filename |" );
+	} else {
+		open( IN, "< $filename" );
+	}
+
+	my $max_read=65536;
+	my $linetotal=0;
+
+	while( not eof IN ) {
+		my @linedata = ();
+
+		my $linecount=0;
+		# １行づつ読んで配列変数に格納する。
+		for ( $linecount = 0 ; $linecount < $max_read ; $linecount++ ) {
+			if ( $linecount % 1024 == 0 ) { debugprintf( $logger_debug, "\$linecount=%d\n", $linecount ); }
+
+			# 入力文字列は utf8 から内部形式に変換して配列変数に入れる
+			$linedata[$linecount] = decode_utf8( <IN> );
+
+			# ストリームの終端ならループを抜ける
+			last if ( eof IN );
+		}
+
+		# 読み込んだ行数を記録する。
+		$linetotal += $linecount;
+debugprintf( $logger_debug, "linetotal=%d, linecount=%d\n", $linetotal, $linecount );
+
+		my $readpointer=0;
+		my $readpointer_prev=0;
+
+		my $readpointer_prev_ok_start=$max_read + 1;
+#		my $readpointer_prev_ok_end=-1;
+		my $readpointer_prev_ok_end=$linecount;
+
+		while( $readpointer < $linecount ) {
+
+			# 標準入力から読んだ行に日付時刻が含まれていたら unix 秒で受け取る
+			my $line = $linedata[$readpointer];
+			my $unixtime = &convert_datetime_string2unixtime( $line );
+
+debugprintf( $logger_debug, "read line: readpointer=%d, linecount=%d, unixtime=%d, %s\n", $readpointer, $linecount, $unixtime, $line );
+
+			if ( $hopsearch == 0 ) {
+				# $unixtime が -1 の場合はログから日時を解釈できていないので
+				# 直前の行評価で取得できた日時を用いる。
+				if ( $unixtime == -1 ) {
+					$unixtime = $unixtime_prev;
+				}
+
+				# 検出した日付が直前の行より古い場合も
+				# 直前の行評価で取得できた日時を用いる。
+				if ( $unixtime < $unixtime_prev && $filename ne "/dev/stdin") {
+					$unixtime = $unixtime_prev;
+				}
+
+				# この行の unix秒を記憶しておき、次の行で時刻が取得できなかった場合の
+				# 代替え用に用いる。1
+				$unixtime_prev=$unixtime;
+	#print "$unixtime ";
+			}
+#			$readpointer_prev_ok_end = $linecount;
+
+			if ( $hopsearch == 1 ) {
+
+				# 現在のバッファ内に抽出開始位置や抽出終了位置が含まれるか否かを調べる
+
+				# ログから日時が取得できていたら処理を行う
+				if ( 0 < $unixtime ) {
+
+					if ( $unixtime < $start ) {
+						# ログの日時が抽出開始日時より古い場合ならば、
+						# 次は残りの後半の中央点を読む。
+
+						# 現在の行番号を控えておく
+						$readpointer_prev = $readpointer;
+
+						# 現在の位置を基準に、残りの半分を加える
+						$readpointer = int($readpointer + ( $linecount - $readpointer ) / 2);
+						if ( $readpointer >= $linecount - 1 ) {
+							$readpointer = $linecount;
+							$unixtime_prev=0;
+						}
+debugprintf( $logger_info, encode_utf8("末尾方向にサーチします。start(%s) >= unixtime(%s)\n"),
+	encode_utf8(unixtime2string($start)), encode_utf8(unixtime2string($unixtime)) );
+					} elsif ( $start <= $unixtime ) {
+						# ログの日時が抽出開始日時以降の場合は
+						# 検出した日付が検索開始位置を過ぎているなら、逆方向に hopsearch する。
+
+debugprintf( $logger_info, encode_utf8("先頭方向にサーチします。start(%s) <= unixtime(%s)\n"),
+	encode_utf8(unixtime2string($start)), encode_utf8(unixtime2string($unixtime)) );
+
+						if ( $readpointer_prev_ok_start >= $readpointer ) {
+							$readpointer_prev_ok_start=$readpointer;
+debugprintf( $logger_info, encode_utf8("現在の行を仮に抽出開始位置とします。（現在の行 %d は既知の抽出開始位置 %d よりも古いため。）\n"), $readpointer, $readpointer_prev_ok_start );
+						}
+
+						if ( int($readpointer / 2) != 1 ) {
+							$linecount = $readpointer;
+							$readpointer=$readpointer_prev;
+							$unixtime_prev=0;
+debugprintf( $logger_info, encode_utf8("次の検索開始行を %d に変更します。\n"), $readpointer );
+						} else {
+debugprintf( $logger_info, encode_utf8("次の検索開始行を %d から %d に変更します。\n"), $readpointer, $readpointer_prev );
+							$readpointer = $readpointer_prev;
+#							$hopsearch=0;
+						}
+					}
+
+						# 参照中の行が抽出範囲内に入っていて、
+						# かつ、既知の最終行以降ならば
+						# 既知の最終行を現在行に変更する
+						if ( $unixtime <= $end &&
+							$readpointer >= $readpointer_prev_ok_end &&
+							$linecount == $max_read &&
+							$filename ne "/dev/stdin") {
+							$readpointer_prev_ok_end=$readpointer;
+						}
+
+				}
+debugprintf( $logger_debug, "hopsearch=%d, readpointer=%s\n", $hopsearch, $readpointer_prev_ok_start );
+			} else {
+				if ( $start <= $unixtime && $unixtime <= $end ) {
+					 #  ログの日付時刻が指定範囲内なら行を表示する。
+debugprintf( $logger_debug, "start:%d end:%d unix:%d diff:%d ", $start, $end, $unixtime, $unixtime-$start );
+
+					# 出力文字列は内部形式から utf8 に変換する（お約束）
+					print encode_utf8($linedata[$readpointer]);
+				}
+			}
+
+debugprintf( $logger_debug, "linecount=%d, readpointer=%d, readpointer_prev_ok_start=%d, readpointer_prev_ok_end=%d\n",
+	$linecount, $readpointer, $readpointer_prev_ok_start, $readpointer_prev_ok_end );
+			if ( $linecount == $readpointer &&
+				0 <= $readpointer_prev_ok_start &&
+				$readpointer_prev_ok_end != -1 ) {
+
+				my $printcounter=0;
+				#for ( $printcounter = $readpointer_prev_ok_start ;
+				#	$printcounter < $max_read;
+				#	$printcounter++ ) {
+				for ( $printcounter = $readpointer_prev_ok_start ;
+					$printcounter <= $readpointer_prev_ok_end ;
+					$printcounter++ ) {
+
+					my $unixtime = &convert_datetime_string2unixtime( $linedata[$printcounter] );
+
+					if ( $unixtime == -1 ) {
+						$unixtime = $unixtime_prev;
+					}
+
+					if ( $unixtime < $unixtime_prev ) {
+						$unixtime = $unixtime_prev;
+					}
+					$unixtime_prev=$unixtime;
+
+					if ( $unixtime <= $end ) {
+						print encode_utf8($linedata[$printcounter]);
+					}
+				}
+
+			}
+debugprintf( $logger_info, "end_while: hopsearch=%d\n\n", $hopsearch );
+#debugsleep( 0, 0.5 );
+#sleep 1;
 		}
 	}
 }
 
-exit 0;
+########################################
+sub get_args {
+	# 引数の評価
+	my (
+		$retval_start,	# 抽出開始日次
+		$retval_end	# 抽出終了日次
+	) = @_;
 
+	# 抽出開始、終了日時の初期値
+	my $start =0;
+	my $end   =9223372036854775807;
+
+	GetOptions(
+		\%opts,
+		qw( start=s end=s recent=i help usage debug=i ) ) or exit 1;
+
+	debugprint( $logger_info, %opts, "\n"  );
+
+
+	if ( $opts{"usage"} == 1 || $opts{"help"} == 1 ) {
+		&print_usage();
+		exit 1
+	}
+
+	if ( length( $opts{"start"} ) > 0 ) {
+		# 指定された文字列を日時の始点とする。
+		$start=&convert_datetime_string2unixtime( $opts{"start"} );
+
+		# convert_datetime_string2unixtime の直前の文字列マッチパターンをリセットする
+		$function_prev="";
+
+		debugprint( $logger_info, "start=$start\n" );
+	} else {
+		# start の指定が無く、end の指定も無い場合は、現在時刻から $recent 分だけ遡った時刻を始点とする。
+		debugprint( $logger_info, "end=$end\n" );
+
+		if ( $opts{"end"} == $end ) {
+			$start= time - 60 * $opts{"recent"};
+		}
+	}
+
+	if ( $opts{"end"} ne "" ) {
+		# 指定された文字列を日時の終点とする。
+		$end=&convert_datetime_string2unixtime( $opts{"end"} );
+
+		# convert_datetime_string2unixtime の直前の文字列マッチパターンをリセットする
+		$function_prev="";
+	} else {
+		# パラメータ end  は初期値を設定しているので、
+		# 実はこの処理が走ることはない。
+		#
+		# それにも拘わらず、この処理が走った場合は、現在時刻を終点とする。
+		$end  = time;
+	}
+
+	$$retval_start = $start;
+	$$retval_end   = $end;
+}
+
+sub unixtime2string{
+	my $unixtime = shift;
+	my ($sec, $min, $hour, $day, $mon, $year) = localtime($unixtime);
+
+	return sprintf('%04d-%02d-%02d %02d:%02d:%02d', $year + 1900, $mon + 1, $day, $hour, $min, $sec);
+}
 
 
 
 # 指定されたファイルを読み、指定期間のログがあれば出力する。
 sub analyze_log {
-	my ( $filename ) = @_;
+	my ( $filename, $start, $end, $hopsearch_flag ) = @_;
 	my $unixtime_prev=0;
 
 	open( IN, "< $filename" );
-	while(<IN>) {
+
+	my @linepointer = ( 0 );
+	my $linecount=0;
+
+	# ファイル参照の場合は、各行の開始位置のファイルポインタを
+	# 予め探しておく。
+	if ( $hopsearch_flag == 1 ) {
+		while(<IN>) {
+			push( @linepointer, tell IN );
+			$linecount++;
+		}
+		seek( IN, 0, 0 );
+	}
+
+	my $readpointer=0;
+	my $readpointer_prev=0;
+	while (<IN>) {
 
 		# 入力文字列は utf8 から内部形式に変換する（お約束）
 		$_ = decode_utf8( $_ );
@@ -207,29 +496,68 @@ sub analyze_log {
 		# 標準入力から読んだ行に日付時刻が含まれていたら unix 秒で受け取る
 		my $unixtime = &convert_datetime_string2unixtime( $_ );
 
-		# $unixtime が -1 の場合はログから日時を解釈できていないので
-		# 直前の行評価で取得できた日時を用いる。
-		if ( $unixtime == -1 ) {
-			$unixtime = $unixtime_prev;
+
+		if ( $hopsearch_flag == 0 ) {
+			# $unixtime が -1 の場合はログから日時を解釈できていないので
+			# 直前の行評価で取得できた日時を用いる。
+			if ( $unixtime == -1 ) {
+				$unixtime = $unixtime_prev;
+			}
+
+			# 検出した日付が直前の行より古い場合も
+			# 直前の行評価で取得できた日時を用いる。
+			if ( $unixtime < $unixtime_prev && $filename ne "/dev/stdin") {
+				$unixtime = $unixtime_prev;
+			}
+
+			# この行の unix秒を記憶しておき、次の行で時刻が取得できなかった場合の
+			# 代替え用に用いる。1
+			$unixtime_prev=$unixtime;
 		}
 
-		# 検出した日付が直前の行より古い場合も
-		# 直前の行評価で取得できた日時を用いる。
-		if ( $unixtime < $unixtime_prev ) {
-			$unixtime = $unixtime_prev;
+		if ( $hopsearch_flag == 1 ) {
+			# 検出した日付が検索範囲よりも前ならば、さらに先に hopsearch_flag する。
+			if ( 0 < $unixtime ) {
+				if ( $unixtime < $start ) {
+					$readpointer_prev = $readpointer;
+					$readpointer = int($readpointer + ( $linecount - $readpointer ) / 2);
+					if ( $readpointer >= $linecount - 1 ) {
+						$readpointer = $linecount;
+						$hopsearch_flag=0;
+						$unixtime_prev=0;
+					}
+debugprintf( $logger_debug, "search_forward: %d ptr:%d line:%d read:%d unix:%d unixprev:%d start:%d %d %d\n", $hopsearch_flag, tell(), $linecount, $readpointer, $unixtime, $unixtime_prev, $start, $start - $unixtime, $linecount-$readpointer );
+				} elsif ( $start < $unixtime ) {
+					# 検出した日付が検索開始位置を過ぎているなら、逆方向に hopsearch_flag する。
+					if ( int($readpointer / 2) != 1 ) {
+						$linecount = $readpointer;
+						$readpointer=$readpointer_prev;
+						$unixtime_prev=0;
+					} else {
+						$readpointer = $readpointer_prev;
+						$hopsearch_flag=0;
+					}
+debugprintf( $logger_debug, "-hop:%d ptr:%d line:%d read:%d unix:%d unixprev:%d start:%d %d %d\n", $hopsearch_flag, tell(), $linecount, $readpointer, $unixtime, $unixtime_prev, $start, $start - $unixtime, $linecount-$readpointer );
+				}
+
+				if ( $linecount - $readpointer < 100 ) {
+					$readpointer = $readpointer_prev;
+					$hopsearch_flag=0;
+				}
+
+				seek( IN, $linepointer[$readpointer], 0 );
+			}
+		} else {
+			if ( $start <= $unixtime && $unixtime <= $end ) {
+				# ログの日付時刻が指定範囲内なら行を表示する。
+				# 出力文字列は内部形式から utf8 に変換する（お約束）
+				print encode_utf8($_);
+debugprintf( $logger_debug, "detect: start:%d end:%d unixtime:%d, line=%s", $start, $end, $unixtime, encode_utf8($_) );
+			} else {
+debugprintf( $logger_debug, "skip: start:%d end:%d unixtime:%d, line=%s", $start, $end, $unixtime, encode_utf8($_) );
+			}
 		}
 
-		#  ログの日付時刻が指定範囲内なら行を表示する。
-		if ( $start <= $unixtime && $unixtime <= $end ) {
-			#print "$start $unixtime $end ";
-
-			# 出力文字列は内部形式から utf8 に変換する（お約束）
-			print encode_utf8($_);
-		}
-
-		# この行の unix秒を記憶しておき、次の行で時刻が取得できなかった場合の
-		# 代替え用に用いる。1
-		$unixtime_prev=$unixtime;
 	}
 }
 
@@ -239,15 +567,6 @@ sub analyze_log {
 sub convert_datetime_string2unixtime {
 	my ( $line ) = @_;
 	my $unixtime = -1;
-	my $day=0;
-	my $month=0;
-	my $year=0;
-	my $hour=0;
-	my $minute=0;
-	my $second=0;
-	my $timezone=0;
-
-	state $function_prev="";
 
 	# 直前に成功したパターンマッチがあれば、そのパターンマッチを再度行う
 	if ( $function_prev ne "" ) {
@@ -268,6 +587,7 @@ sub convert_datetime_string2unixtime {
 			}
 		};
 	}
+debugprintf( $logger_debug, "%s:%d:%s", $function_prev, $unixtime,encode_utf8($line));
 
 	if($@) {
 		return $unixtime;
@@ -275,7 +595,7 @@ sub convert_datetime_string2unixtime {
 	return $unixtime;
 }
 
-
+# http://regexper.com/#%5BA-Za-z%5D%7B3%7D%20(%5BA-Za-z%5D%7B3%7D)%20(%20%3F%5B0-9%5D%7B1%2C2%7D)%20(%5B0-9%5D%7B1%2C2%7D)%3A(%5B0-9%5D%7B1%2C2%7D)%3A(%5B0-9%5D%7B1%2C2%7D)%20%5BA-Za-z%5D%7B3%7D%20(%5B0-9%5D%7B4%2C%7D)
 sub detect_wday_month_mday_time_tz_year {
 	my ( $line ) = @_;
 	my $unixtime = -1;
@@ -287,9 +607,11 @@ sub detect_wday_month_mday_time_tz_year {
 	my $second=0;
 	my $timezone=0;
 
-	if ( $line =~ /[A-Za-z]{3} ([A-Za-z]{3}) ([0-9]{1,2}) ([0-9]{1,2}):([0-9]{1,2}):([0-9]{1,2}) [A-Za-z]{3} ([0-9]{4,})/o ) {
+#printf "%s:%s\n", (caller 0)[3], $line;
+	if ( $line =~ /[A-Za-z]{3} ([A-Za-z]{3}) ( ?[0-9]{1,2}) ([0-9]{1,2}):([0-9]{1,2}):([0-9]{1,2}) [A-Za-z]{3} ([0-9]{4,})/o ) {
 
 		# wDay month mday hh:mm:ss timezone year
+		# Tue Nov 13 13:20:07 JST 2012
 		$day=$2;
 		$month=$month_string2num{$1} or die 'xxx';
 		$year=$6;
@@ -303,6 +625,37 @@ sub detect_wday_month_mday_time_tz_year {
 	return $unixtime
 }
 
+# http://regexper.com/#%5BA-Za-z%5D%7B3%7D%20(%5BA-Za-z%5D%7B3%7D)%20%20%3F(%5B0-9%5D%7B1%2C2%7D)%20(%5B0-9%5D%7B1%2C2%7D)%3A(%5B0-9%5D%7B1%2C2%7D)%3A(%5B0-9%5D%7B1%2C2%7D)%20(%5B0-9%5D%7B4%2C%7D)
+sub detect_wday_month_mday_time_year {
+	my ( $line ) = @_;
+	my $unixtime = -1;
+	my $day=0;
+	my $month=0;
+	my $year=0;
+	my $hour=0;
+	my $minute=0;
+	my $second=0;
+	my $timezone=0;
+
+#   #              wday        1:month        2:day        3:hour       4:min        5:sec        6:year
+	if ( $line =~ /[A-Za-z]{3} ([A-Za-z]{3}) ( ?[0-9]{1,2}) ([0-9]{1,2}):([0-9]{1,2}):([0-9]{1,2}) ([0-9]{4,})/o ) {
+
+		# wDay month mday hh:mm:ss year
+		# Tue Nov 13 13:20:07 2012
+		$month=$month_string2num{$1} or die 'xxx';
+		$day=$2;
+		$year=$6;
+
+		$hour=$3;
+		$minute=$4;
+		$second=$5;
+
+		$unixtime = mktime($second, $minute, $hour, $day, $month - 1, $year - 1900 );
+    }
+    return $unixtime
+}
+
+# http://regexper.com/#(%5B0-9%5D%7B1%2C2%7D)%5C%2F(%5B0-9A-Za-z%5D%7B1%2C3%7D)%5C%2F(%5B0-9%5D%7B4%2C%7D)%5B%3A%20%5D(%5B0-9%5D%2B)%3A(%5B0-9%5D%2B)%3A(%5B0-9%5D%2B)%20(%5B%2B%5C-%5D%3F)(%5B0-9%5D%5B0-9%5D)%3A%3F(%5B0-9%5D%5B0-9%5D)
 sub detect_mday_month_year_time {
 	my ( $line ) = @_;
 	my $unixtime = -1;
@@ -314,9 +667,9 @@ sub detect_mday_month_year_time {
 	my $second=0;
 	my $timezone=0;
 
-	if ( $line =~ /([0-9]{1,2})\/([0-9A-Za-z]{1,3})\/([0-9]{4,})[: ]([0-9]+):([0-9]+):([0-9]+) ([+\-]?)([0-9][0-9]):?([0-9][0-9])/o ) {
-		# mday/month/year hh:mm:ss
-		# mday/month/year:hh:mm:ss
+	if ( $line =~ /([0-9]{1,2})\/([0-9A-Za-z]{1,3})\/([0-9]{4,})[: ]([0-9]+):([0-9]+):([0-9]+)( [+\-])?([0-9][0-9])?:?([0-9][0-9])?/o ) {
+		# mday/month/year hh:mm:ss zz
+		# mday/month/year:hh:mm:ss zz
 
 		$day=$1;
 		$month=$month_string2num{$2} or die 'xxx';
@@ -325,7 +678,7 @@ sub detect_mday_month_year_time {
 		$hour=$4;
 		$minute=$5;
 		$second=$6;
-		$timezone=$9 + $8 * 60;
+		if ( defined($8) && defined($9) ) { $timezone=$9 + $8 * 60; }
 
 		$unixtime = mktime($second, $minute, $hour, $day, $month - 1, $year - 1900 );
 	}
@@ -333,6 +686,7 @@ sub detect_mday_month_year_time {
 }
 
 
+# http://regexper.com/#(%5B0-9A-Za-z%5D*)%20(%5B0-9%5D%7B1%2C2%7D)%2C%20(%5B0-9%5D%7B4%2C%7D)%20(%20%3F%5B0-9%5D%7B1%2C2%7D)%3A(%5B0-9%5D%7B1%2C2%7D)%3A(%5B0-9%5D%7B1%2C2%7D)(%20(.*)%3F)%3F
 sub detect_month_mday_year_time {
 	my ( $line ) = @_;
 	my $unixtime = -1;
@@ -344,7 +698,7 @@ sub detect_month_mday_year_time {
 	my $second=0;
 	my $timezone=0;
 
-	if ( $line =~ /([0-9A-Za-z]*) ([0-9]{1,2}), ([0-9]{4,}) ([0-9]{1,2}):([0-9]{1,2}):([0-9]{1,2}) (.*?) /o ) {
+	if ( $line =~ /([0-9A-Za-z]*) ([0-9]{1,2}), ([0-9]{4,}) ( ?[0-9]{1,2}):([0-9]{1,2}):([0-9]{1,2})( (.*)?)?/o ) {
 		# month mday, year hh:mm:ss
 		# month mday, year hh:mm:ss (am|pm)
 
@@ -357,9 +711,10 @@ sub detect_month_mday_year_time {
 		$second=$6;
 
 		# 午前/午後の時刻補正処理
-		if ( defined($7) ) {
-			if ( exists $ampm_string2hour{$7} ) {
-				$hour += $ampm_string2hour{$7};
+		if ( defined($8) ) {
+			$hour = $hour % 12;
+			if ( exists $ampm_string2hour{$8} ) {
+				$hour += $ampm_string2hour{$8};
 			}
 		}
 
@@ -370,6 +725,7 @@ sub detect_month_mday_year_time {
 	return $unixtime
 }
 
+# http://regexper.com/#(%5B0-9%5D%7B4%2C%7D)%5B%5C-%5C%2F%5D(%5B0-9%5D%7B1%2C2%7D)%5B%5C-%5C%2F%5D(%5B0-9%5D%7B1%2C2%7D)%5B%20T%5D(%5B0-9%5D%7B1%2C2%7D)%3A(%5B0-9%5D%7B1%2C2%7D)%3A(%5B0-9%5D%7B1%2C2%7D)
 sub detect_year_month_mday_time {
 	my ( $line ) = @_;
 	my $unixtime = -1;
@@ -381,8 +737,11 @@ sub detect_year_month_mday_time {
 	my $second=0;
 	my $timezone=0;
 
-	if ( $line =~ /([0-9]{4,})[\-\/]([0-9]{1,2})[\-\/]([0-9]{1,2})[ T]([0-9]{1,2}):([0-9]{1,2}):([0-9]{1,2})/o ) {
+	if ( $line =~ /([0-9]{4,})[\-\/]([0-9]{1,2})[\-\/]([0-9]{1,2})[ T]([0-9]{1,2}):([0-9]{1,2}):([0-9]{1,2})/ ) {
 		# yyyy/mm/dd hh:mm:ss
+		# yyyy/mm/ddThh:mm:ss
+		# yyyy-mm-dd hh:mm:ss
+		# yyyy-mm-ddThh:mm:ss
 
 		$year=$1;
 		$month=$month_string2num{$2} or die 'zzz';
@@ -397,6 +756,7 @@ sub detect_year_month_mday_time {
 	return $unixtime
 }
 
+# http://regexper.com/#(%5B0-9%5D%7B4%2C%7D)%E5%B9%B4%5B%20%5D%7B1%2C2%7D(%5B0-9%5D%7B1%2C2%7D)%E6%9C%88%5B%20%5D%7B1%2C2%7D(%5B0-9%5D%7B1%2C2%7D)%E6%97%A5%20(.*%3F)%20(%5B0-9%5D%7B1%2C2%7D)%3A(%5B0-9%5D%7B1%2C2%7D)%3A(%5B0-9%5D%7B1%2C2%7D)%20%5BA-Za-z%5D%7B3%7D
 sub detect_year_month_mday_time_kanji {
 	my ( $line ) = @_;
 	my $unixtime = -1;
@@ -425,6 +785,7 @@ sub detect_year_month_mday_time_kanji {
 	return $unixtime
 }
 
+# http://regexper.com/#(%5B0-9%5D%7B4%2C%7D)%5B%5C-%5C%2F%5D(%5B0-9%5D%7B1%2C2%7D)%5B%5C-%5C%2F%5D(%5B0-9%5D%7B1%2C2%7D)%5B%20T%5D(%5B0-9%5D%7B1%2C2%7D)%3A(%5B0-9%5D%7B1%2C2%7D)
 sub detect_year_month_mday_hour_minute {
 	my ( $line ) = @_;
 	my $unixtime = -1;
@@ -451,6 +812,7 @@ sub detect_year_month_mday_hour_minute {
 	return $unixtime
 }
 
+# http://regexper.com/#(%5B0-9%5D%7B4%2C%7D)%5B%5C-%5C%2F%5D(%5B0-9%5D%7B1%2C2%7D)%5B%5C-%5C%2F%5D(%5B0-9%5D%7B1%2C2%7D)%5B%20T%5D(%5B0-9%5D%7B1%2C2%7D)
 sub detect_year_month_mday_hour {
 	my ( $line ) = @_;
 	my $unixtime = -1;
@@ -478,6 +840,7 @@ sub detect_year_month_mday_hour {
 	return $unixtime
 }
 
+# http://regexper.com/#(%5B0-9%5D%7B4%2C%7D)%5B%5C-%5C%2F%5D(%5B0-9%5D%7B1%2C2%7D)%5B%5C-%5C%2F%5D(%5B0-9%5D%7B1%2C2%7D)
 sub detect_year_month_mday {
 	my ( $line ) = @_;
 	my $unixtime = -1;
@@ -505,6 +868,8 @@ sub detect_year_month_mday {
 	return $unixtime
 }
 
+
+# http://regexper.com/#(%5B0-9%5D%7B1%2C2%7D)%3A(%5B0-9%5D%7B1%2C2%7D)%3A(%5B0-9%5D%7B1%2C2%7D)
 sub detect_year_hour_minute_second {
 	my ( $line ) = @_;
 	my $unixtime = -1;
@@ -533,6 +898,7 @@ sub detect_year_hour_minute_second {
 	return $unixtime
 }
 
+# http://regexper.com/#(%5B0-9%5D%7B1%2C2%7D)%3A(%5B0-9%5D%7B1%2C2%7D)
 sub detect_hour_minute {
 	my ( $line ) = @_;
 	my $unixtime = -1;
@@ -578,3 +944,52 @@ sub detect_unixtime {
 	}
 	return $unixtime
 }
+
+########################################
+sub get_func_info{
+	my $func_name = (caller 2)[3];
+	my $func_line = (caller 1)[2];
+	$func_name =~ s/.*:://;
+
+#	print "$func_name , $func_line\n";
+	my $result_string = sprintf( "%s:%s", $func_line, $func_name );
+
+	return $result_string;
+}
+
+sub debugprintf {
+
+	my $debuglevel = shift( @_ );
+	my $format = shift( @_ );
+	my $this_func_name = get_func_info();
+
+	if ( $opts{"debug"} >= $debuglevel &&
+		defined( $format ) &&
+		defined( @_ ) ) {
+		#print  STDERR "[DEBUG:$debuglevel]:";
+		my $string=encode_utf8(sprintf $format, @_);
+		printf STDERR "[%s:%s] ", $logger_label[$debuglevel], $this_func_name;
+		printf STDERR $format, @_;
+	}
+}
+
+sub debugprint {
+	my $debuglevel = shift( @_ );
+	my $this_func_name = get_func_info();
+
+	if ( $opts{"debug"} >= $debuglevel ) {
+		#print STDERR "[DEBUG:$debuglevel]:@_";
+		printf STDERR "[%s:%s] ", $logger_label[$debuglevel], $this_func_name;
+		print  STDERR @_;
+	}
+}
+
+sub debugsleep {
+	my ( $debuglevel, $sleepwait ) = @_;
+
+	if ( $opts{"debug"} >= $debuglevel ) {
+		select undef, undef, undef, $sleepwait;
+	}
+
+}
+
